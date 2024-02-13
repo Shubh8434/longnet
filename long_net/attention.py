@@ -1,13 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-# from long_net.attend import FlashAttention
 from zeta.nn.attention.flash_attention import FlashAttention
 from long_net.utils import XPOS, RelativePositionBias
 
-
-# add alibi, qk layer norm, one write head, multihway,
 class DilatedAttention(nn.Module):
     """
     Dilated Attention Module.
@@ -80,11 +76,31 @@ class DilatedAttention(nn.Module):
         self.proj_k = nn.Linear(dim, dim)
         self.proj_v = nn.Linear(dim, dim)
 
-    def get_mask(self, i, j):
-        """i = row, j=column"""
-        return torch.ones((i, j), device=self.device, dtype=torch.bool).triu(
-            j - i + 2
-        )
+    def get_mask(self, n, device):
+        if self.mask is not None and self.mask.shape[-1] >= n:
+            return self.mask[:n, :n]
+
+        if self.mask is None:
+            print('computing mask..')
+
+        mask = torch.ones((n, n), device=device, dtype=torch.bool).triu(1)
+        k = 0
+        segment_lengths = [4, 8, 16]
+        dilation_rates = [1, 2, 4]
+        # segment_lengths = [2048, 4096, 8192, 16384, 32768]
+        # dilation_rates = [1, 2, 4, 6, 12]
+        for i in range(len(mask)):
+            for j in range(len(mask[0])):
+                will_mask = True
+                for segment_length, dilation_rate in zip(segment_lengths, dilation_rates):
+                    if np.floor(i/segment_length) == np.floor(j/segment_length) and i % dilation_rate == 0 and j % dilation_rate == 0:
+                        will_mask = False
+                if will_mask:
+                    mask[i][j] = True
+                k += 1
+        self.register_buffer("mask", mask, persistent=False)
+        self.mask = mask
+        return mask
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass of the DilatedAttention module.
@@ -117,6 +133,7 @@ class DilatedAttention(nn.Module):
 
         # Perform attention
         attn_output = self.attention(q, k, v)
+        print(attn_output.shape)
 
         # if use rel pos => apply relative positioning bias
         if self.use_rel_pos_bias:
@@ -126,12 +143,14 @@ class DilatedAttention(nn.Module):
 
         # if causal create a mask and apply to the output
         if self.causal:
-            mask = self.get_mask(attn_output.size(1), attn_output.size(1))
-
+            mask = self.get_mask(n=attn_output.size(1), device='cuda:0')
             attn_output = attn_output.masked_fill(mask, float("-inf"))
 
         # apply dropout
         attn_output = self.dropout(attn_output)
-        # Scatter and concatenate
+        print(attn_output.shape)
+        # Reshape the output to match the expected shape
         attn_output = attn_output.reshape(batch_size, -1, self.dim)
+        print(attn_output.shape)
+
         return attn_output
